@@ -1,0 +1,35 @@
+---
+abstract: 'The pg_cryobit application'
+author:
+  - 'Jerome Eteve <jerome@eteve.net>'
+build_requires:
+  ExtUtils::MakeMaker: 6.42
+  File::Spec: 0
+  Test::Exception: 0
+  Test::More: 0
+  Test::postgresql: 0.09
+configure_requires:
+  ExtUtils::MakeMaker: 6.42
+distribution_type: module
+generated_by: 'Module::Install version 0.92'
+license: perl
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: App-PgCryobit
+no_index:
+  directory:
+    - inc
+    - t
+requires:
+  Config::General: 2.44
+  DBD::Pg: 2.16.1
+  File::Basename: 2.76
+  File::Copy: 2.11
+  File::Temp: 0
+  Getopt::Long: 2.37
+  Moose: 0.94
+  Pod::Usage: 1.35
+resources:
+  license: http://dev.perl.org/licenses/
+version: 0.01_02
