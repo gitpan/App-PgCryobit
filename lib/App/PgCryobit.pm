@@ -11,7 +11,7 @@ App::PgCryobit - The pg_cryobit application
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02_01
 
 =head1 SYNOPSIS
 
@@ -22,7 +22,7 @@ by the pg_cryobit command.
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02_01';
 
 has 'config_paths' => ( is => 'ro' , isa => 'ArrayRef', required =>  1);
 has 'configuration' => ( is => 'ro' , isa => 'HashRef' , lazy_build => 1 ); 
@@ -57,13 +57,17 @@ sub _build_shipper{
     my ($self) = @_;
     my $shipper_factory;
     my $factory_class = $self->configuration->{shipper}->{plugin};
+
+    my $load_err;
     eval{ $shipper_factory = Class::MOP::load_class($factory_class) };
+    $load_err = $@;
     unless( $shipper_factory ){
-	$factory_class = 'App::PgCryobit::ShipperFactory::'.$factory_class;
-	eval{ $shipper_factory = Class::MOP::load_class($factory_class) };
+      $factory_class = 'App::PgCryobit::ShipperFactory::'.$factory_class;
+      eval{ $shipper_factory = Class::MOP::load_class($factory_class) };
+      $load_err = $@;
     }
     unless( $shipper_factory ){
-	die "Cannot load factory plugin ".$factory_class.".\n  * If this class is known to exists, try loading it with perl -M$factory_class\n";
+      die "Cannot load factory plugin ".$factory_class.": $load_err.\n  * If this class is known to exists, try loading it with perl -M$factory_class\n";
     }
     return $factory_class->new( { config => $self->configuration->{shipper} } )->build_shipper();
 }
@@ -296,7 +300,7 @@ sub feature_archivesnapshot{
     eval{
       # Prefix archive name with configuration 'snapshooting_dir' or current dir
       $archive_full_file = ( $self->configuration->{snapshooting_dir} || './' ).$archive_name;
-      my $cmd = 'tar -cvzhf '.$archive_full_file.' '.$self->configuration->{data_directory};
+      my $cmd = 'tar -czhf '.$archive_full_file.' '.$self->configuration->{data_directory};
       my $tar_ret = system($cmd);
       if( $tar_ret != 0 ){
 	die "Archiving command $cmd has failed\n";
