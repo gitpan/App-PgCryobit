@@ -4,6 +4,9 @@ extends qw/App::PgCryobit::Shipper/;
 
 use Net::FTP;
 use File::Basename;
+use Log::Log4perl;
+
+my $LOGGER = Log::Log4perl->get_logger();
 
 ## Ftp server config
 has 'ftp_host' => ( is => 'ro' , isa => 'Str' , required => 1 );
@@ -14,7 +17,7 @@ has 'ftp_password' => ( is => 'ro' , isa => 'Str', required => 1 );
 ## The destination directory in the ftp server
 has 'backup_dir' => ( is => 'ro' , isa => 'Str' , required => 1 );
 
-has 'net_ftp' => ( is => 'ro' , isa => 'Net::FTP' , lazy_build => 1);
+##has 'net_ftp' => ( is => 'ro' , isa => 'Net::FTP' , lazy_build => 1);
 
 =head1 NAME
 
@@ -39,11 +42,24 @@ has 'snapshot_dir' => ( is => 'ro', isa => 'Str', lazy_build => 1);
 ## Return a connected ftp
 sub _build_net_ftp{
   my ($self) = @_;
+  $LOGGER->info("Connecting to ".$self->ftp_host().':'.$self->ftp_port());
   my $ftp = Net::FTP->new($self->ftp_host() , Port => $self->ftp_port() ) or
     die "Cannot connect to '".$self->ftp_host.":".$self->ftp_port()."' : $@ \n";
+  $LOGGER->info("Login in as ".$self->ftp_user()." using password");
   $ftp->login($self->ftp_user() , $self->ftp_password())
     or die "ftp_session: Cannot login as ".$self->ftp_user().":".$ftp->message;
   return $ftp;
+}
+
+=head2 net_ftp
+
+Returns a fresh connection to the ftp server.
+
+=cut
+
+sub net_ftp{
+  my ($self) = @_;
+  return $self->_build_net_ftp();
 }
 
 sub _ftp_session{
@@ -52,6 +68,7 @@ sub _ftp_session{
   my $ret;
   eval{
     $ret = &{$sub}($ftp);
+    $ftp->quit();
   };
   my $err = $@;
   if ( $err ) {
@@ -68,6 +85,7 @@ sub _ensure_subdir{
         my $ftp = shift;
         ## We always issue a mkdir command.
         ## It is harmful if the directory exists.
+        $LOGGER->info("Making directory $sub_dir on FTP server");
         my $new_dir = $ftp->mkdir($sub_dir , 'RECURSE') or die "Cannot create $sub_dir";
         return $sub_dir;
        };
@@ -97,16 +115,22 @@ sub check_config{
   my $ftp = $self->net_ftp();
 
   ## Check we can change to the remote root server.
+  $LOGGER->info("Changing to ".$self->backup_dir());
   $ftp->cwd($self->backup_dir())
     or die "Cannot change to ".$self->backup_dir.":".$ftp->message."\n";
 
   ## We are connected and in the right directory
   ## Check we can write and destroy some ping dir
+  $LOGGER->info("Making test directory check_config_test");
   $ftp->mkdir('check_config_test')
     or die "Cannot make test directory :".$ftp->message."\n";
 
+  $LOGGER->info("Cleaning test directory check_config_test");
   $ftp->rmdir('check_config_test')
     or die "Cannot destroy test directory :".$ftp->message."\n";
+
+  ## Finish the ftp session. Others will use their own
+  $ftp->quit();
 
   unless ( $self->xlog_dir() ) {
     die "Cannot make xlog_dir";
@@ -127,16 +151,19 @@ sub _ship_file{
   my $do_stuff =
     sub{
         my $ftp = shift;
+        $LOGGER->debug("Testing $destination existence");
         if ( $ftp->mdtm( $destination ) ) {
           die "Destination file $destination already exists for copying $file\n";
         }
         # Copy the file to the basename
+        $LOGGER->info("Sending $file to $destination");
         $ftp->binary();
         my $remote_name = $ftp->put($file,$destination);
         unless( $remote_name ){
           my $message = $ftp->message();
           ## Issue a delete. In case the transfer failed
                              ## in the middle.
+          $LOGGER->error("Transfer failed. Cleaning $destination");
           $ftp->delete($destination);
           die "Copy from $file to $destination failed:".$message;
         }
@@ -180,6 +207,7 @@ sub xlog_has_arrived{
   my $do_stuff =
     sub{
         my $ftp = shift;
+        $LOGGER->debug("Checking if $xlog_file has reached FTP directory ".$self->xlog_dir());
         if ( $ftp->mdtm( $self->xlog_dir().'/'.$xlog_file  ) ) {
           return 1;
         }
@@ -194,6 +222,7 @@ sub _clean_files_youngerthan{
     sub{
         my $ftp = shift;
         ## List files in basedir
+        $LOGGER->info("Cleaning files in $base_dir");
         my $list = $ftp->ls($base_dir) or die "Cannot list $base_dir on ".$self->ftp_host.' : '.$ftp->message();
         foreach my $candidate ( @{$list} ) {
           if ( $candidate =~ /\.$/ ) {
@@ -201,6 +230,7 @@ sub _clean_files_youngerthan{
             next;
           }
           if ( basename($candidate) lt $file ) {
+            $LOGGER->debug("Deleting $base_dir/$candidate");
             $ftp->delete($base_dir.'/'.$candidate) or die "Cannot delete $base_dir/$candidate:".$ftp->message();
           }
         }
