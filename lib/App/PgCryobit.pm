@@ -2,9 +2,11 @@ package App::PgCryobit;
 
 use Moose;
 use Config::General;
+use Class::Load;
 use File::Temp;
 use DBI;
 use Log::Log4perl;
+use Data::UUID;
 use Data::Dumper;
 
 =head1 NAME
@@ -13,7 +15,7 @@ App::PgCryobit - The pg_cryobit application
 
 =head1 VERSION
 
-Version 0.03_01
+Version 0.03
 
 =head1 SYNOPSIS
 
@@ -24,7 +26,7 @@ by the pg_cryobit command.
 
 =cut
 
-our $VERSION = '0.03_01';
+our $VERSION = '0.03';
 
 has 'config_paths' => ( is => 'ro' , isa => 'ArrayRef', required =>  1);
 has 'configuration' => ( is => 'ro' , isa => 'HashRef' , lazy_build => 1 );
@@ -34,6 +36,8 @@ has 'shipper' => ( is => 'ro' , isa => 'App::PgCryobit::Shipper' , lazy_build =>
 ## The command line options. The script sets these.
 has 'options' => ( is => 'rw', isa => 'HashRef' , default => sub{ return {} } );
 has 'config_general' => ( is => 'rw' , isa => 'Config::General' );
+
+has 'uuid_gen' => ( is => 'ro', isa => 'Data::UUID' , default => sub{ return Data::UUID->new() });
 
 my $LOGGER = Log::Log4perl->get_logger();
 
@@ -59,7 +63,8 @@ sub _build_configuration{
       return \%configuration;
     }
   }
-  die "No pg_cryobit.conf could be found in paths ".join(':',@{$self->config_paths()});
+  die "No pg_cryobit.conf could be found in paths ".join(':',@{$self->config_paths()})
+    ."\n Look here for examples: https://github.com/jeteve/pg_cryobit/tree/master/App-PgCryobit/conf_example\n";
 }
 
 sub _build_shipper{
@@ -90,11 +95,11 @@ sub load_factory_class{
   my $load_err;
   my $shipper_factory;
 
-  eval{ $shipper_factory = Class::MOP::load_class($factory_class) };
+  eval{ $shipper_factory = Class::Load::load_class($factory_class) };
   $load_err = $@;
   unless( $shipper_factory ){
     $factory_class = 'App::PgCryobit::ShipperFactory::'.$factory_class;
-    eval{ $shipper_factory = Class::MOP::load_class($factory_class) };
+    eval{ $shipper_factory = Class::Load::load_class($factory_class) };
     $load_err = $@;
   }
   unless( $shipper_factory ){
@@ -131,15 +136,17 @@ sub feature_checkconfig{
     ## Check this data_directory can be read
     ## This is useful for full archive
     unless(( -d $conf->{data_directory} ) && ( -r $conf->{data_directory} )){
-      $LOGGER->error("Cannot read directory ".$conf->{data_directory}." (defined in ".$conf->{this_file}.")");
+      $LOGGER->error("Cannot access directory ".$conf->{data_directory}." in Read mode (defined in ".$conf->{this_file}.")");
       return 1;
     }
 
     if ( $conf->{snapshooting_dir} ){
       unless( ( -d $conf->{snapshooting_dir} ) && ( -w $conf->{snapshooting_dir} ) ){
-	$LOGGER->error("Cannot access ".$conf->{snapshooting_dir}." in Write mode (defined in ".$conf->{this_file}.")");
-	return 1;
+        $LOGGER->error("Cannot access ".$conf->{snapshooting_dir}." in Write mode (defined in ".$conf->{this_file}.")");
+        return 1;
       }
+    }else{
+      $LOGGER->warn("Conf file ".$conf->{this_file}." deos not contain 'snapshooting_dir'. Will snapshot in current working directory.");
     }
 
     unless( $conf->{dsn} ){
@@ -148,26 +155,29 @@ sub feature_checkconfig{
     }
 
     ## Check we can connect using the dsn
-    my $dbh = DBI->connect($conf->{dsn}, undef , undef , { RaiseError => 0 , PrintError => 0 });
+    ## my ($password ) = ( $conf->{dsn} =~ /password=(\.+)/ );
+
+    my $password = undef;
+    my $dbh = DBI->connect($conf->{dsn}, undef , $password , { RaiseError => 0 , PrintError => 0 });
     unless( $dbh ){
-      $LOGGER->error("Cannot connect to ".$conf->{dsn}." defined in ".$conf->{this_file});
+      $LOGGER->error("Cannot connect to ".$conf->{dsn}." defined in ".$conf->{this_file}.": ".$DBI::errstr);
       return 1;
     }
     ## Check we can call some xlog administrative functions
     my ($current_xlogfile) = $dbh->selectrow_array('SELECT pg_xlogfile_name(pg_current_xlog_location())');
     unless( $current_xlogfile ){
-      $LOGGER->error("Cannot find current_xlogfile. Make sure your dsn connects to the DB as a super user in ".$conf->{this_file});
+      $LOGGER->error("Cannot find current_xlogfile (calling pg_current_xlog_location() ). Make sure your dsn connects to the DB as a super user in ".$conf->{this_file});
       return 1;
     }
     ## Check archive mode is ON
     my ($archive_mode) = $dbh->selectrow_array('SHOW archive_mode');
     unless( $archive_mode eq 'on' ){
-      $LOGGER->error("archive_mode is NOT 'on' in database. Please fix that");
+      $LOGGER->error("archive_mode is NOT 'on' in database. Please fix that in your postgresql.conf");
       return 1;
     }
     my ($archive_command) = $dbh->selectrow_array('SHOW archive_command');
     unless( $archive_command =~ /pg_cryobit/ ){
-      $LOGGER->error("archive_command (=$archive_command) does NOT use of pg_cryobit. Please fix that");
+      $LOGGER->error("archive_command (=$archive_command) does NOT use of pg_cryobit. It should look like 'pg_cryobit archivewal --file=\%p' ");
       return 1;
     }
 
@@ -278,12 +288,16 @@ sub feature_rotatewal{
     my ($archive_command) = $dbh->selectrow_array('SHOW archive_command');
 
     ## Perform some transactions so the forced rotation will actually rotate.
-    $dbh->do('DROP TABLE IF EXISTS pg_cryobit_to_force_rotation');
-    $dbh->do('CREATE TABLE pg_cryobit_to_force_rotation (id TEXT)');
-    $dbh->do('INSERT INTO pg_cryobit_force_rotation(id) VALUES(\'Blablabla\')');
-    $dbh->do('DROP TABLE pg_cryobit_to_force_rotation');
+    my $transaction_forcing_table = 'pg_cryobit_'.$self->uuid_gen->create_hex();
+    $dbh->do('CREATE TABLE '.$transaction_forcing_table.' (id TEXT)');
+    $dbh->do('INSERT INTO '.$transaction_forcing_table.'(id) VALUES(\'Blablabla\')');
+    $dbh->do('DROP TABLE '.$transaction_forcing_table);
 
     my ($shipped_log) = $dbh->selectrow_array('SELECT pg_xlogfile_name(pg_switch_xlog())');
+    unless( $shipped_log ){
+      $LOGGER->fatal("Could not switch xlog in Postgresql: ".$DBI::errstr." ABORTING");
+      return 1;
+    }
     $LOGGER->info("PostgreSQL will attempt to ship file $shipped_log using archive_command $archive_command");
     $dbh->disconnect();
 
@@ -293,15 +307,16 @@ sub feature_rotatewal{
     my $time_spend_waiting = 0;
     sleep(1);
     while( $time_spend_waiting < 60 ){
-	if( $shipper->xlog_has_arrived($shipped_log) ){
-          $LOGGER->info("Shipped Log file $shipped_log has arrived.");
-          return 0;
-	}
-	sleep(10);
-	$time_spend_waiting += 10;
+      if( $shipper->xlog_has_arrived($shipped_log) ){
+        $LOGGER->info("Shipped Log file $shipped_log has arrived.");
+        return 0;
+      }
+      $LOGGER->info("Log file $shipped_log has not been shipped by Postgresql yet after $time_spend_waiting secs. Waiting 10secs more");
+      sleep(10);
+      $time_spend_waiting += 10;
     }
 
-    $LOGGER->error(qq|File $shipped_log is not arrived after we waited for $time_spend_waiting seconds. Please check your PostgreSQL logs|);
+    $LOGGER->fatal(qq|File $shipped_log is not arrived after we waited for $time_spend_waiting seconds. Please check your PostgreSQL logs|);
     return 1;
 }
 
@@ -321,8 +336,8 @@ sub feature_archivesnapshot{
     my ($archive_row) = $dbh->selectrow_array('SELECT pg_xlogfile_name_offset(pg_start_backup('.$dbh->quote($archive_name).'))');
     my ($archived_wal,$archived_offset) = ( $archive_row =~ /\((\w+?),(\w+?)\)/ );
     unless( $archived_wal && $archived_offset ){
-	$LOGGER->error("Cannot parse wal and offet from $archive_row");
-	return 1;
+      $LOGGER->error("Cannot parse wal and offet from $archive_row. ".$DBI::errstr);
+      return 1;
     }
     $archived_offset = sprintf("%08x", $archived_offset);
 
@@ -331,15 +346,17 @@ sub feature_archivesnapshot{
       # Prefix archive name with configuration 'snapshooting_dir' or current dir
       $archive_full_file = ( $self->configuration->{snapshooting_dir} || './' ).$archive_name;
       my $cmd = 'tar -czhf '.$archive_full_file.' '.$self->configuration->{data_directory};
+      $LOGGER->info("Doing $cmd ..");
       my $tar_ret = system($cmd);
       if( $tar_ret != 0 ){
-	die "Archiving command $cmd has failed\n";
+        die "Archiving command $cmd has failed (returned $tar_ret)\n";
       }
     };
     if ( $@ ){
-	$dbh->selectrow_array('SELECT  pg_xlogfile_name_offset( pg_stop_backup())');
-	$LOGGER->error("CRASH in building the main archive: $@");
-	return 1;
+      $LOGGER->info("Swicthing off Postgresql backup mode.");
+      $dbh->selectrow_array('SELECT  pg_xlogfile_name_offset( pg_stop_backup())');
+      $LOGGER->error("CRASH in building the main archive: $@");
+      return 1;
     }
     my ($end_archived_row) = $dbh->selectrow_array('SELECT  pg_xlogfile_name_offset( pg_stop_backup())');
 
@@ -347,40 +364,43 @@ sub feature_archivesnapshot{
 
     ## Ship the archive file
     eval{
-	$shipper->ship_snapshot_file($archive_full_file);
+      $shipper->ship_snapshot_file($archive_full_file);
     };
     if( $@ ){
-	$LOGGER->error("Error shipping $archive_name : $@");
-	return 1;
+      $LOGGER->error("Error shipping $archive_name : $@");
+      return 1;
     }
     ## Wait for archive_wal.archive_offset.backup to be shipped.
     my $time_spend_waiting = 0;
     sleep(1);
     while( $time_spend_waiting < 60 ){
-	if( $shipper->xlog_has_arrived($archived_wal) && $shipper->xlog_has_arrived($archived_wal.'.'.$archived_offset.'.backup') ){
-	    $time_spend_waiting = 0;
-	    last;
-	}
-	sleep(10);
-	$time_spend_waiting += 10;
+      if( $shipper->xlog_has_arrived($archived_wal) && $shipper->xlog_has_arrived($archived_wal.'.'.$archived_offset.'.backup') ){
+        $time_spend_waiting = 0;
+        last;
+      }
+      $LOGGER->info("Log file $archived_wal and backup marker $archived_wal.$archived_offset.backup  have not been shipped by Postgresql yet after $time_spend_waiting secs. Waiting 10secs more");
+      sleep(10);
+      $time_spend_waiting += 10;
     }
     if( $time_spend_waiting ){
-	$LOGGER->error("$archived_wal and $archived_wal.$archived_offset.backup are not shipped after $time_spend_waiting seconds");
-	return 1;
+      $LOGGER->error("$archived_wal and $archived_wal.$archived_offset.backup are not shipped after $time_spend_waiting seconds");
+      return 1;
+    }else{
+      $LOGGER->info("$archived_wal and $archived_wal.$archived_offset.backup have been shipped.");
     }
 
     if( $self->options()->{deepclean} ){
       $LOGGER->info("Will perform a deep clean");
       ## Deepcleaning has been requested
       eval{
-	$LOGGER->info("Cleaning wal logs younger than $archived_wal");
-	$shipper->clean_xlogs_youngerthan($archived_wal);
-	$LOGGER->info("Cleaning archives snapshots younger than $archive_name");
-	$shipper->clean_archives_youngerthan($archive_name);
+        $LOGGER->info("Cleaning wal logs younger than $archived_wal");
+        $shipper->clean_xlogs_youngerthan($archived_wal);
+        $LOGGER->info("Cleaning archives snapshots younger than $archive_name");
+        $shipper->clean_archives_youngerthan($archive_name);
       };
       if( $@ ){
-	$LOGGER->error("Cannot perform deepclean : $@");
-	return 1;
+        $LOGGER->error("Cannot perform deepclean : $@");
+        return 1;
       }
     } ## end of if deepclean
     return 0;
